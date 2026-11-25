@@ -13,14 +13,19 @@ import zipfile, re, argparse
 def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument('deck')
-    ap.add_argument('--width', type=float, default=1152.0)
-    ap.add_argument('--height', type=float, default=648.0)
+    ap.add_argument('--width', type=float, default=0.0, help='slide width in pt (auto-detected if omitted)')
+    ap.add_argument('--height', type=float, default=0.0, help='slide height in pt (auto-detected if omitted)')
     ap.add_argument('--page', type=int, default=None, help='dump all shapes on this page')
     return ap.parse_args()
 
 A = parse_args()
-SW, SH = A.width, A.height
 z = zipfile.ZipFile(A.deck)
+SW, SH = A.width, A.height
+if not SW or not SH:
+    _s = z.read('ppt/presentation.xml').decode('utf-8', 'ignore')
+    _m = re.search(r'<p:sldSz[^>]*cx="(\d+)"[^>]*cy="(\d+)"', _s)
+    SW = float(_m.group(1)) / 12700 if _m else 960.0
+    SH = float(_m.group(2)) / 12700 if _m else 540.0
 slides = sorted([x for x in z.namelist() if re.fullmatch(r'ppt/slides/slide\d+\.xml', x)],
                 key=lambda x: int(re.search(r'\d+', x).group()))
 print(f'deck={A.deck}  slides={len(slides)}  size={SW}x{SH} pt')

@@ -40,15 +40,19 @@ Never overwrite a file the user may have edited. Before any script runs:
 
 **Why this matters:** a patch script can fail silently and an unpatched copy can overwrite a hand-edited file. Confirm the values of `SRC`/`OUT` before executing any copied script, and stop if a patch fails.
 
-### Step 1 — Inspect the deck
+### Step 1 — Inspect, name, prepare templates
 
 Run `scripts/inspect_deck.py <input.pptx>` to dump per-slide shape counts, geometry, font sizes, names, and existing animation targets. Determine:
-- Slide size `SW`, `SH` (the bundled script defaults to 1152×648 pt; adjust in config)
+- Slide size `SW`, `SH` — auto-detected by all scripts, no manual config needed
 - Slide count `N`
 - Whether slides are already named with `!!` prefixes
 - Whether there are existing animations/off-screen clones (needs stripping)
 
-If the deck is already animated or re-animating, use the `--strip` path (Step 2a). For a fresh deck, first establish naming with `scripts/apply_naming.py` (see `references/naming.md`) — every shape must have a deterministic `!!` name before Morph logic.
+If `!!named=0`, run `scripts/apply_naming.py <baseline.pptx> <named.pptx>` first. This assigns deterministic page-unique names (`!!TITLE_Pn`, `!!IMG_Pn_k`, `!!BG_Pn_k`, `!!HL_Pn_k`, `!!VL_Pn_k`, `!!C_Pn_k`) so Morph never smart-matches the wrong shapes. Use the named deck as `SRC`.
+
+The build script needs real animation XML for presetIDs 10/42/55/2/53. If the source lacks them, run `scripts/prepare_templates.py --src <baseline.pptx> --out <tpl.pptx> --donors <deckA.pptx> <deckB.pptx> ...` and pass `--tpl <tpl.pptx>` to the build. Donor decks can be any PPTX on the machine containing those effects. The tool classifies effects by **real visual behavior** (`fade` / `scale` / `motion`) and synthesizes a genuine `p:animScale` Zoom when donors only contain fade blocks — never just rename `presetID` on a fade effect.
+
+If the deck is already animated or re-animating, the build's strip pass removes old `<p:timing>` and generated off-screen clones while preserving on-screen edits.
 
 ### Step 2 — Build
 
@@ -72,11 +76,15 @@ The build runs these passes in order; each addresses a specific observed defect:
 | rels | Build `RELS[]` map; `fix_picture_rels()` remaps `r:embed` on every copied `<p:pic>` | Images showing wrong picture and morphing from wrong shape |
 | 1 | Fly-in: for each adjacent pair, copy next-slide non-tertiary content to previous slide off-screen, same name. Neighbor elements in the same row are grouped to one direction. | Elements suddenly appearing with no transition |
 | 2 | Fly-out: copy major current-slide elements to next slide off-screen. Exception: page-1 decorative ellipses must always fly out even if small. | Ellipse↔rectangle forced morph (rounded-corner artifacts) |
-| 3 | In-page animations: page 1 gets all on-screen elements animated and no Morph; other pages animate only tertiary text. Build `<p:timing>` with 5 rotating rhythms, first delay = 0. | Monotonous timing, text appearing before its card |
+| 3 | In-page animations: page 1 gets all on-screen elements animated and no Morph; other pages animate only tertiary text. Build `<p:timing>` with 5 rotating rhythms, first delay = 0, normalize every effect duration to 400 ms, and keep a real visual behavior (`animEffect` / `animScale` / `animMotion`) for each effect. | Monotonous timing, text appearing before its card, text "popping in" from donor fade templates |
 | 4 | z-order alignment: fix on-screen order, insert off-screen clones at the paired element's percentile on the adjacent page (fallback to global percentile if pair is also off-screen) | Layer flicker at transition midpoint |
 | 5 | Anchored-text layer fix: text sitting on a color block must be above it | White text hidden or "popping" during morph |
 
-### Step 3 — Verify (MANDATORY; run `scripts/verify.py`)
+### Step 3 — Verify (MANDATORY; run both scripts)
+
+1. `scripts/verify.py <animated.pptx> --src <baseline.pptx>` — text/picture/z-order/timing checks.
+2. `scripts/validate_openxml.py <animated.pptx>` — strict OOXML schema validation using the DocumentFormat.OpenXml assembly shipped with Microsoft Office (requires `pip install pythonnet`). This catches issues that zip/XML well-formedness checks and python-pptx miss. If Office is not installed, report that this check was skipped.
+3. `scripts/check_powerpoint_open.py <animated.pptx>` — open the file in a real PowerPoint instance (read-only) to catch repair prompts caused by bad relationship targets. Schema validators alone will not catch these. If PowerPoint is not installed, report that this check was skipped.
 
 Check all of the following and do not deliver if any fail:
 
@@ -102,9 +110,22 @@ This is a common request ("I edited the deck, redo the animation"). Procedure:
 3. The strip pass removes old animation and off-screen clones while preserving every on-screen shape and font change. Do **not** regenerate from the pristine original.
 4. Verify text equality against the baseline, then deliver.
 
+## Compatibility notes
+
+- The Morph wrapper uses PowerPoint's native MCE structure: `p159` is declared on `mc:Choice`, `p`/`p14` locally on `p:transition`, `mc:Fallback` uses a local `p` declaration, and no `mc:Ignorable` or `xmlns=""` is added to the slide root. This is accepted by strict Office/WPS parsers.
+- Never fabricate a preset by replacing only `presetID="53"` on a fade block; short rating words will still fade or appear to pop in. Use a real `p:animScale` effect.
+- WPS may ignore Morph and show a plain fade; that is expected fallback behavior, not a repair condition.
+- Media/audio pictures have `r:link`/`r:id` in addition to `r:embed`. The build script remaps all of them and preserves relationship Type/TargetMode (see `references/pitfalls.md` P16). Never revert to embed-only remapping.
+- If PowerPoint still reports "content was removed / needs repair", make isolation builds: (a) animations removed, (b) Morph transitions removed, (c) off-screen clones removed, then (d) shape clones only vs picture clones only. Open each with PowerPoint COM (`Presentations.Open`) to find the failing feature automatically; schema validators alone do not catch bad relationship targets.
+- Never overwrite the user's hand-edited file; always deliver a new versioned output.
+
 ## Resources
 
-- `scripts/build_morph_anim.py` — production build script (all passes above)
+- `scripts/build_morph_anim.py` — production build script (all passes above; slide size auto-detected)
+- `scripts/apply_naming.py` — deterministic `!!` naming for un-named decks
+- `scripts/prepare_templates.py` — build the `--tpl` deck from source + donor decks
+- `scripts/validate_openxml.py` — strict OOXML validation via the Office assembly
+- `scripts/check_powerpoint_open.py` — real PowerPoint open test (detects repair prompts)
 - `scripts/verify.py` — completeness/consistency verifier
 - `scripts/inspect_deck.py` — shape/text/animation dump for planning
 - `references/concepts.md` — detailed explanation of Morph mechanics, naming rules, animation presetIDs, and timing rhythms

@@ -116,3 +116,23 @@ Each entry is a common defect observed in real-world decks, with the root cause 
 3. Add `assert os.path.abspath(SRC) != os.path.abspath(OUT)` to every build script.
 4. Always output a new version number. Never overwrite a file the user may have edited.
 5. Full backup of the workspace to TEMP before large cleanup operations.
+
+## P16 — Media/audio pictures: r:link and r:id must be remapped too
+
+**Symptom:** PowerPoint reports "found a problem with some content / repaired and removed content" after adding cross-slide fly-out/in clones. OOXML schema validation and text/picture checks all pass. Removing only the cloned `<p:pic>` shapes makes the file open.
+
+**Root cause:** A picture-shaped audio/video object contains multiple relationship references: `<a:blip r:embed>`, `<a:audioFile r:link>`, `<p14:media r:embed>`, and `<a:hlinkClick r:id>`. The old `fix_picture_rels()` remapped only `r:embed`, leaving `r:link`/`r:id` pointing at unrelated parts on the destination slide. It also hard-coded the new relationship Type as `image`, which breaks media relationships.
+
+**Fix:** Remap all of `r:embed`, `r:link`, `r:id`, `r:dm`, `r:lo`, `r:qs`, `r:cs`. Build a reverse map keyed by `(Type, Target, TargetMode)` and preserve the source Type/TargetMode when creating new relationships. Leave empty `r:id=""` untouched. Verify by opening the deck in PowerPoint (COM `Presentations.Open` works for silent checking) — schema validators alone will not catch this.
+
+## P17 — Donor fade templates make text look like it just pops in
+
+**Symptom:** Animation targets exist and `verify.py` reports 69 animation targets, but on playback the text only "appears" with no visible fade or zoom. Short rating words are especially obvious.
+
+**Root cause:** `presetID` alone does not define the visual effect. Many donor decks contain a fade effect even for presetIDs 42/55/53. `prepare_templates.py` used to clone a fade block and only replace `presetID="10"` with `presetID="53"`, so the generated "Zoom" was still `<p:animEffect filter="fade">`. Worse, donor fades were often 327 ms, so even real fades looked instantaneous after the build failed to normalize their duration.
+
+**Fix:**
+1. Classify harvested blocks by actual visual behavior: `animScale` > `animMotion` > `animEffect/fade`.
+2. Synthesize a real `<p:animScale zoomContents="1"><p:from .../><p:to .../></p:animScale>` for presetIDs 53 and 55 when a real scale block is missing.
+3. Normalize every numeric `dur` > 1 to the configured value (400 ms) in `build_effect()`; keep `dur="1"` on the visibility `<p:set>`.
+4. Make `verify.py` require at least one visual behavior (`animEffect`, `animScale`, or `animMotion`) per presetID.

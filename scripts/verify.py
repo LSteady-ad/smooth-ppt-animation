@@ -21,13 +21,20 @@ def parse_args():
     ap = argparse.ArgumentParser()
     ap.add_argument('deck')
     ap.add_argument('--src', help='baseline deck to compare on-screen text')
-    ap.add_argument('--width', type=float, default=1152.0)
-    ap.add_argument('--height', type=float, default=648.0)
+    ap.add_argument('--width', type=float, default=0.0, help='slide width in pt (auto-detected if omitted)')
+    ap.add_argument('--height', type=float, default=0.0, help='slide height in pt (auto-detected if omitted)')
     ap.add_argument('--slides', type=int, default=None)
     return ap.parse_args()
 
 A = parse_args()
 SW, SH = A.width, A.height
+if not SW or not SH:
+    _z = zipfile.ZipFile(A.deck)
+    _s = _z.read('ppt/presentation.xml').decode('utf-8', 'ignore')
+    _z.close()
+    _m = re.search(r'<p:sldSz[^>]*cx="(\d+)"[^>]*cy="(\d+)"', _s)
+    SW = float(_m.group(1)) / 12700 if _m else 960.0
+    SH = float(_m.group(2)) / 12700 if _m else 540.0
 
 def slide_count(z):
     if A.slides: return A.slides
@@ -117,15 +124,20 @@ def main():
             fails.append(f'P{p} Morph presence wrong')
         t = re.search(r'<p:timing>.*?</p:timing>', s, re.S)
         if t:
-            aids = set(re.findall(r'<p:spTgt spid="(\d+)"', t.group(0)))
+            tt = t.group(0)
+            aids = set(re.findall(r'<p:spTgt spid="(\d+)"', tt))
             anim_total += len(aids)
             for sid in aids:
                 if sid not in ids: fails.append(f'P{p} animation target {sid} missing')
-            ds = [int(x) for x in re.findall(r'<p:cond delay="(\d+)"', t.group(0))]
+            presets = len(re.findall(r'presetID="\d+"', tt))
+            visual = len(re.findall(r'<p:animEffect|<p:animScale|<p:animMotion', tt))
+            if visual < presets:
+                fails.append(f'P{p} has {presets} effects but only {visual} visual behaviors (pop-in risk)')
+            ds = [int(x) for x in re.findall(r'<p:cond delay="(\d+)"', tt)]
             if ds:
                 if min(ds) != 0: fails.append(f'P{p} first delay {min(ds)} != 0')
                 if max(ds) + 400 > 4000: fails.append(f'P{p} animation ends at {max(ds)+400}ms > 4s')
-    print(f'  [OK] structure/timing checked, {anim_total} animation targets')
+    print(f'  [OK] structure/timing checked, {anim_total} animation targets, visual behaviors present')
 
     # 6. z-order
     S = {p: shapes(z, p) for p in range(1, N+1)}

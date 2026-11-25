@@ -40,18 +40,25 @@ AI 自动执行完整工作流：
 ## 手动命令行用法
 
 ```bash
-# 1. 检查原始演示文稿结构
-python scripts/inspect_deck.py input.pptx --page 4
+# 0. 若 inspect 显示 !!named=0，先建立确定性命名
+python scripts/apply_naming.py input.pptx named.pptx
 
-# 2. 构建动画（源文件不会被修改）
+# 1. 检查结构（页面尺寸会自动识别）
+python scripts/inspect_deck.py named.pptx --page 4
+
+# 2. 生成动画模板：从源稿和任意含动画的 donor 稿提取真实效果
+python scripts/prepare_templates.py --src named.pptx --out tpl.pptx \
+  --donors donor1.pptx donor2.pptx
+
+# 3. 构建动画（源文件不会被修改）
 python scripts/build_morph_anim.py \
-  --src input.pptx \
+  --src named.pptx \
   --out input_animated.pptx \
-  --ref clean_named_deck.pptx \   # 可选：已有 !! 命名体系的参考稿
-  --tpl deck_with_templates.pptx  # 可选：含 presetID 10/42/55/2/53 的模板稿
+  --tpl tpl.pptx
 
-# 3. 校验结果
-python scripts/verify.py input_animated.pptx --src input.pptx
+# 4. 校验（含真实视觉行为与 OOXML 严格校验）
+python scripts/verify.py input_animated.pptx --src named.pptx
+python scripts/validate_openxml.py input_animated.pptx
 ```
 
 ## 目录结构
@@ -61,9 +68,13 @@ smooth-ppt-animation/
 ├── SKILL.md                     入口说明与完整工作流
 ├── README.md                    本文件
 ├── scripts/
+│   ├── apply_naming.py           为未命名稿建立 !! 配对名
+│   ├── prepare_templates.py      提取 / 合成真实动画模板
 │   ├── build_morph_anim.py       生产构建脚本
-│   ├── verify.py                 完整性 / 一致性校验脚本
-│   └── inspect_deck.py           构建前结构检查脚本
+│   ├── verify.py                 完整性 / 一致性 / 视觉行为校验
+│   ├── inspect_deck.py           构建前结构检查脚本
+│   ├── validate_openxml.py       Office 严格 OOXML 校验
+│   └── check_powerpoint_open.py  PowerPoint 实机打开检测
 └── references/
     ├── concepts.md               Morph 原理、命名、动画类型与时序
     ├── pitfalls.md               常见失败案例与修复方法
@@ -75,6 +86,8 @@ smooth-ppt-animation/
 - 跨页配对只可靠依赖 `!!name`；没有 `!!` 的元素会被 PowerPoint 智能配错
 - `r:embed` 是页本地关系，复制图片到别的页必须重新映射
 - 第一个动画延迟必须为 0，否则平滑结束后会“等一下才出字”
+- 动画预设必须带有真实视觉效果；只改 `presetID` 不改效果块会让文字看起来“突然出现”
+- 所有动画时长统一归一化到 400ms，避免 donor 稿里的 327ms 等过短效果
 - 同名配对元素不仅形状要合适，z-order 百分位也要接近
 - 大面积色块即便外形不完全一样，也可以参与跨页平滑；小装饰元素则页唯一化，避免误配
 - 绝不覆盖用户可能编辑过的文件，始终输出新版本

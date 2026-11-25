@@ -28,8 +28,8 @@ def parse_args():
     ap.add_argument('--out', required=True, help='new output deck (must differ from --src)')
     ap.add_argument('--ref', default=None, help='clean named deck for the strip pass')
     ap.add_argument('--tpl', default=None, help='deck containing animation templates')
-    ap.add_argument('--width', type=float, default=1152.0, help='slide width in points')
-    ap.add_argument('--height', type=float, default=648.0, help='slide height in points')
+    ap.add_argument('--width', type=float, default=0.0, help='slide width in points (auto-detected if omitted)')
+    ap.add_argument('--height', type=float, default=0.0, help='slide height in points (auto-detected if omitted)')
     ap.add_argument('--slides', type=int, default=None, help='slide count (default: auto-detect)')
     ap.add_argument('--work', default=None, help='temp unpack dir (default: auto)')
     return ap.parse_args()
@@ -40,6 +40,14 @@ OUT = ARGS.out
 REF = ARGS.ref
 TPL_SRC = ARGS.tpl or SRC
 SW, SH = ARGS.width, ARGS.height
+if not SW or not SH:
+    _z = zipfile.ZipFile(SRC)
+    _s = _z.read('ppt/presentation.xml').decode('utf-8', 'ignore')
+    _m = re.search(r'<p:sldSz[^>]*cx="(\d+)"[^>]*cy="(\d+)"', _s)
+    _z.close()
+    SW = float(_m.group(1)) / 12700 if _m else 960.0
+    SH = float(_m.group(2)) / 12700 if _m else 540.0
+print(f'slide size: {SW:.0f}x{SH:.0f} pt')
 WORK = ARGS.work or os.path.join(tempfile.gettempdir(), 'smooth_ppt_animation_work')
 assert os.path.abspath(SRC) != os.path.abspath(OUT), 'source and output must differ'
 
@@ -94,12 +102,18 @@ def extract_tpls():
 
 TPLS = extract_tpls()
 print("模板:", {k:len(v) for k,v in TPLS.items()})
+_missing = [p for p in (10, 53) if p not in TPLS]
+if _missing:
+    raise SystemExit('missing animation template presetID(s): ' + ', '.join(map(str, _missing))
+                     + ' — run scripts/prepare_templates.py first')
 
 # 解包
 if os.path.exists(WORK): shutil.rmtree(WORK)
 os.makedirs(WORK)
 z=zipfile.ZipFile(SRC,'r')
 for n in z.namelist():
+    if n.endswith('/'):
+        continue
     p=os.path.join(WORK,n.replace('/',os.sep)); os.makedirs(os.path.dirname(p),exist_ok=True)
     open(p,'wb').write(z.read(n))
 z.close()
@@ -285,39 +299,55 @@ RELS={}
 for _pn in range(1,N+1):
     _fp=os.path.join(WORK,f'ppt/slides/_rels/slide{_pn}.xml.rels')
     _s=open(_fp,encoding='utf-8').read()
-    _rels=re.findall(r'<Relationship Id="([^"]+)"[^>]*Target="([^"]+)"[^>]*/>',_s)
-    RELS[_pn]={'s':_s,'map':dict(_rels),'used':set(re.findall(r'Id="(rId\d+)"',_s))}
+    _info={}; _map={}
+    for _m in re.finditer(r'<Relationship\s+([^>]*?)/?>',_s):
+        _a=dict(re.findall(r'(\w+)="([^"]*)"',_m.group(1)))
+        if 'Id' not in _a: continue
+        _info[_a['Id']]=(_a.get('Type',''),_a.get('Target',''),_a.get('TargetMode',''))
+        _map[_a['Id']]=_a.get('Target','')
+    RELS[_pn]={'s':_s,'map':_map,'info':_info,
+               'used':set(re.findall(r'Id="(rId\d+)"',_s))}
+
+REL_ATTRS='embed|link|id|dm|lo|qs|cs'
 
 def fix_picture_rels(block, src_page, dst_page):
-    """把块内所有 r:embed 从源页关系映射到目标页正确关系"""
-    if '<p:pic' not in block:
+    """Remap every relationship reference in a copied shape block.
+
+    Images use r:embed, but media/audio shapes also use r:link and p14:media
+    uses r:embed on a *media* relationship. Copying only r:embed leaves stale
+    r:link/r:id values pointing at unrelated parts on the destination slide,
+    which makes PowerPoint report the file needs repair. New relationships
+    must preserve the source Type and TargetMode, not assume 'image'.
+    """
+    if not re.search(r'r:(?:'+REL_ATTRS+r')="rId\d+"',block):
         return block
-    srcmap=RELS[src_page]['map']; dst=RELS[dst_page]
-    # 目标页 target -> rId 反查（复用现成关系，避免重复添加）
-    rev={t:r for r,t in dst['map'].items()}
+    srcinfo=RELS[src_page]['info']; dst=RELS[dst_page]
+    rev=collections.defaultdict(list)
+    for _r,(_t,_g,_m) in dst['info'].items():
+        rev[(_t,_g,_m)].append(_r)
     remap={}
-    for m in re.finditer(r'r:embed="(rId\d+)"',block):
-        rid=m.group(1)
-        if rid in remap: continue
-        target=srcmap.get(rid)
-        if not target:
-            continue
-        if target in rev:
-            remap[rid]=rev[target]
+    def repl(m):
+        attr,rid=m.group(1),m.group(2)
+        if not rid: return m.group(0)
+        if rid in remap: return f'r:{attr}="{remap[rid]}"'
+        info=srcinfo.get(rid)
+        if not info: return m.group(0)
+        if rev.get(info):
+            newrid=rev[info][0]
         else:
-            # 新建关系
             n=1
             while f'rId{n}' in dst['used']: n+=1
             newrid=f'rId{n}'
             dst['used'].add(newrid)
-            dst['map'][newrid]=target
-            rel=f'<Relationship Id="{newrid}" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/image" Target="{target}"/>'
+            dst['info'][newrid]=info
+            typ,tgt,mode=info
+            mode_attr=f' TargetMode="{mode}"' if mode else ''
+            rel=f'<Relationship Id="{newrid}" Type="{typ}" Target="{tgt}"{mode_attr}/>'
             dst['s']=dst['s'].replace('</Relationships>',rel+'</Relationships>')
-            rev[target]=newrid
-            remap[rid]=newrid
-    if not remap: return block
-    return re.sub(r'r:embed="(rId\d+)"',
-                  lambda m:f'r:embed="{remap.get(m.group(1),m.group(1))}"',block)
+            rev[info].append(newrid)
+        remap[rid]=newrid
+        return f'r:{attr}="{newrid}"'
+    return re.sub(r'r:('+REL_ATTRS+r')="(rId\d*)"',repl,block)
 
 def flush_rels():
     for _pn in range(1,N+1):
@@ -497,20 +527,53 @@ def build_effect(tpl, spid, idgen, ntype, dur, delay=0):
     e=tpl.replace('__SPID__',str(spid))
     e=re.sub(r' id="__ID__"',lambda x:f' id="{next(idgen)}"',e)
     e=re.sub(r'nodeType="(?:afterEffect|clickEffect|withEffect)"',f'nodeType="{ntype}"',e)
-    e=re.sub(r'dur="(?:1000|500)"',f'dur="{dur}"',e)
+    # Normalize every real animation duration (keep dur="1" for the visibility set).
+    # Donor decks often contain 327/350 ms effects; without this they look like a pop-in.
+    e=re.sub(r'dur="(\d+)"',lambda m:(f'dur="{dur}"' if int(m.group(1))>1 else m.group(0)),e)
     # 只改外层 cTn 的起始延迟（模板中第一个 cond），实现卡片间轻微错峰
     if delay:
         e=e.replace('<p:cond delay="0"/>',f'<p:cond delay="{delay}"/>',1)
     return f'<p:par>{e}</p:par>'
 
+MORPH_XML = (
+    '<mc:AlternateContent xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006">'
+    '<mc:Choice xmlns:p159="http://schemas.microsoft.com/office/powerpoint/2015/09/main" Requires="p159">'
+    '<p:transition xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+    'xmlns:p14="http://schemas.microsoft.com/office/powerpoint/2010/main" spd="slow" p14:dur="2000">'
+    '<p159:morph option="byObject"/>'
+    '</p:transition></mc:Choice>'
+    '<mc:Fallback><p:transition xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" spd="slow">'
+    '<p:fade/></p:transition></mc:Fallback>'
+    '</mc:AlternateContent>'
+)
+
+def ensure_morph(slide_xml):
+    # Use PowerPoint's native MCE shape: p159 is declared on mc:Choice, p/p14 are
+    # declared locally on p:transition, and no mc:Ignorable is added to the root.
+    # This avoids repair prompts in strict Office/WPS parsers.
+    if '<p159:morph' in slide_xml or '<mc:AlternateContent' in slide_xml:
+        return slide_xml
+    m = re.search(r'</p:clrMapOvr>', slide_xml)
+    if m:
+        return slide_xml[:m.end()] + MORPH_XML + slide_xml[m.end():]
+    m = re.search(r'</p:cSld>', slide_xml)
+    if m:
+        return slide_xml[:m.end()] + MORPH_XML + slide_xml[m.end():]
+    return slide_xml
+
 idgen=itertools.count(50000)
 anim_stat=collections.Counter()
 for pi in range(1,N+1):
     s=slides_raw[pi]
-    shapes=parse_shapes(s)
     if pi==1:
         # 第一页：取消 Morph 切换，屏内全部元素(含背景/导航/装饰)都加动画
         s=re.sub(r'<mc:AlternateContent>.*?</mc:AlternateContent>','',s,count=1,flags=re.S)
+    else:
+        # 新源稿可能完全没有平滑切换；这里补齐默认 2000ms Morph，供屏外副本跨页运动使用
+        s=ensure_morph(s)
+    slides_raw[pi]=s
+    shapes=parse_shapes(s)
+    if pi==1:
         content=[sh for sh in shapes
                  if 0<=sh['x']+sh['w']/2<=SW and 0<=sh['y']+sh['h']/2<=SH
                  and (pi,sh['name']) not in ANCHORED]
